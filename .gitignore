@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables and secrets
+.env
+*.env
+.env.local
+
+# API keys
+openai_api_key.txt
+anthropic_api_key.txt
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Raw and processed data
+data/raw/
+data/processed/
+data/vector_store/
+
+# Uploaded documents
+docs/*.pdf
+docs/*.docx
+docs/*.txt
+
+# Reports generated locally
+reports/*.csv
+reports/*.json
+reports/*.xlsx
+
+# Logs
+logs/
+*.log
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Streamlit
+.streamlit/secrets.toml
+
+# IDE
+.vscode/
+.idea/
