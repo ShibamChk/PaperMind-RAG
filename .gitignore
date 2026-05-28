@@ -50,3 +50,7 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Generated reports
+reports/*.md
+reports/*.txt
