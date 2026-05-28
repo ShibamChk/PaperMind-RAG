@@ -1,4 +1,5 @@
 from pathlib import Path
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -30,3 +31,34 @@ MIN_CHUNK_WORDS = 40
 # Embedding defaults
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 EMBEDDING_BATCH_SIZE = 32
+
+
+class AppSettings(BaseSettings):
+    """
+    Runtime settings loaded from .env.
+
+    LLM_PROVIDER can be:
+        - ollama
+        - openai
+    """
+
+    llm_provider: str = "ollama"
+
+    # Ollama settings
+    ollama_model_name: str = "qwen3:14b"
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_timeout_seconds: int = 900
+
+    # OpenAI settings
+    openai_api_key: str | None = None
+    openai_model_name: str = "gpt-4o-mini"
+
+    model_config = SettingsConfigDict(
+        env_file=PROJECT_ROOT / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
+def get_settings() -> AppSettings:
+    return AppSettings()
