@@ -113,6 +113,25 @@ class AnswerGenerator:
             llm_provider=self.provider,
             model_name=self.model_name,
         )
+    
+    def generate_text(self, prompt: str) -> str:
+        """
+        Generate raw text from a prompt using the configured provider.
+
+        This is used by higher-level generators such as:
+        - Paper Card Generator
+        - Comparison Generator
+        - Gap Finder
+        - Reviewer Mode
+        """
+        if not prompt or not prompt.strip():
+            raise ValueError("Prompt cannot be empty.")
+        if self.provider == "ollama":
+            return self._generate_with_ollama(prompt)
+        if self.provider == "openai":
+            return self._generate_with_openai(prompt)
+        raise ValueError(f"Unsupported provider: {self.provider}")
+
 
     def _generate_with_openai(self, prompt: str) -> str:
         response = self.openai_client.chat.completions.create(
