@@ -54,3 +54,9 @@ Thumbs.db
 # Generated reports
 reports/*.md
 reports/*.txt
+
+__pycache__/
+*.pyc
+
+.streamlit/secrets.toml
+.stramlit/ 

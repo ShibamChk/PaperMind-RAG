@@ -1,0 +1,16 @@
+[server]
+headless = true
+runOnSave = true
+port = 8501
+fileWatcherType = "auto"
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
+primaryColor = "#4F46E5"
+backgroundColor = "#0B1020"
+secondaryBackgroundColor = "#111827"
+textColor = "#E5E7EB"
+font = "sans serif"
