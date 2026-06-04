@@ -6,53 +6,44 @@ import argparse
 import json
 import re
 from dataclasses import dataclass, asdict
-from typing import Optional
+from typing import Optional, Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(PROJECT_ROOT))
 
-from src.retrieval.retriever import PaperRetriever, RetrievedChunk
 from src.generation.answer_generator import AnswerGenerator
-from src.config.settings import CHROMA_DB_DIR, CHROMA_COLLECTION_NAME
+from src.retrieval.evidence_builder import EvidenceBuilder, EvidencePack
 from src.retrieval.vector_store import ChromaVectorStore
+from src.config.settings import CHROMA_DB_DIR, CHROMA_COLLECTION_NAME
 from src.utils.logger import get_logger
 
 
 logger = get_logger(__name__)
 
 
-GAP_QUERIES = {
-    "limitations": (
-        "What limitations, weaknesses, failure cases, or constraints are discussed in this paper?"
-    ),
-    "future_work": (
-        "What future work, open problems, or next research directions are mentioned?"
-    ),
-    "evaluation_gaps": (
-        "What datasets, baselines, metrics, ablation studies, or evaluation settings are used or missing?"
-    ),
-    "scalability": (
-        "Does the paper discuss scalability, efficiency, runtime, memory cost, or deployment challenges?"
-    ),
-    "robustness": (
-        "Does the paper discuss robustness, generalization, noisy data, missing data, distribution shift, or real-world reliability?"
-    ),
-    "reproducibility": (
-        "Does the paper provide code, hyperparameters, dataset details, implementation details, or reproducibility information?"
-    ),
-}
+GAP_EVIDENCE_FIELDS = [
+    "research_gap",
+    "limitations",
+    "future_work",
+    "datasets",
+    "metrics",
+    "results",
+    "reproducibility",
+    "method",
+]
 
 
 @dataclass
 class PaperGapProfile:
     paper: str
     problem_area: str
-    stated_limitations: str
-    missing_or_weak_evaluation: str
+    stated_or_implied_research_gap: str
     dataset_gaps: str
+    evaluation_gaps: str
     scalability_gaps: str
     robustness_gaps: str
     reproducibility_gaps: str
+    limitations: str
     future_work: str
     possible_research_opportunities: list[str]
 
@@ -85,15 +76,17 @@ class ResearchGapReport:
 
 class ResearchGapFinder:
     """
-    Research Gap Finder for multiple papers.
+    Research Gap Finder v2.
 
-    Design:
-        1. Retrieve gap-related evidence separately for each paper.
-        2. Generate a gap profile for each paper.
-        3. Synthesize cross-paper research gaps and experiment ideas.
+    v1 used direct vector retrieval for gap-related queries.
+    v2 uses EvidenceBuilder to create section-aware, keyword-aware,
+    field-specific evidence packs before generating research gaps.
 
-    This avoids the previous issue where the LLM focused on only one paper
-    when all papers were mixed into one large prompt.
+    This is more robust for papers where:
+        - motivation is inside the introduction
+        - gaps are implicit in related work
+        - future work is inside the conclusion
+        - limitations are indirectly implied by experiments or future work
     """
 
     def __init__(
@@ -102,10 +95,14 @@ class ResearchGapFinder:
         llm_provider: Optional[str] = None,
         llm_model_name: Optional[str] = None,
         temperature: float = 0.2,
+        candidate_top_k: int = 20,
+        max_chars_per_evidence: int = 900,
     ):
-        self.top_k_per_query = top_k_per_query
+        self.max_evidence_per_field = top_k_per_query
+        self.candidate_top_k = candidate_top_k
+        self.max_chars_per_evidence = max_chars_per_evidence
 
-        self.retriever = PaperRetriever()
+        self.evidence_builder = EvidenceBuilder()
 
         self.answer_generator = AnswerGenerator(
             provider=llm_provider,
@@ -132,18 +129,18 @@ class ResearchGapFinder:
         source_counter = 1
 
         for file_name in file_names:
-            logger.info("Generating research gap profile for paper: %s", file_name)
+            logger.info("Generating v2 research gap profile for: %s", file_name)
 
-            chunks = self._retrieve_gap_evidence_for_file(file_name=file_name)
+            evidence_packs = self.evidence_builder.build_multiple_evidence_packs(
+                file_name=file_name,
+                field_names=GAP_EVIDENCE_FIELDS,
+                candidate_top_k=self.candidate_top_k,
+                max_evidence_chunks=self.max_evidence_per_field,
+                max_chars_per_chunk=self.max_chars_per_evidence,
+            )
 
-            if not chunks:
-                logger.warning("No gap evidence found for %s", file_name)
-                profile = self._fallback_profile(file_name=file_name)
-                paper_profiles.append(profile.to_dict())
-                continue
-
-            context, sources, source_counter = self._format_context_with_sources(
-                chunks=chunks,
+            evidence_context, sources, source_counter = self._format_evidence_context(
+                evidence_packs=evidence_packs,
                 start_index=source_counter,
             )
 
@@ -151,18 +148,22 @@ class ResearchGapFinder:
 
             profile, raw_output = self._generate_single_paper_gap_profile(
                 file_name=file_name,
-                context=context,
+                evidence_context=evidence_context,
             )
 
             paper_profiles.append(profile.to_dict())
-            raw_outputs.append(f"\n\n--- RAW GAP PROFILE FOR {file_name} ---\n{raw_output}")
+            raw_outputs.append(
+                f"\n\n--- RAW GAP PROFILE FOR {file_name} ---\n{raw_output}"
+            )
 
         cross_report, cross_raw_output = self._generate_cross_paper_gap_report(
             paper_profiles=paper_profiles,
             file_names=file_names,
         )
 
-        raw_outputs.append("\n\n--- RAW CROSS-PAPER GAP OUTPUT ---\n" + cross_raw_output)
+        raw_outputs.append(
+            "\n\n--- RAW CROSS-PAPER GAP OUTPUT ---\n" + cross_raw_output
+        )
 
         return ResearchGapReport(
             analyzed_files=file_names,
@@ -206,85 +207,43 @@ class ResearchGapFinder:
             raw_model_output="\n".join(raw_outputs),
         )
 
-    def _retrieve_gap_evidence_for_file(
-        self,
-        file_name: str,
-    ) -> list[RetrievedChunk]:
-        unique_chunks = {}
-
-        for query_name, query in GAP_QUERIES.items():
-            logger.info("  Gap query dimension: %s", query_name)
-
-            chunks = self.retriever.search(
-                query=query,
-                top_k=self.top_k_per_query,
-                file_name=file_name,
-            )
-
-            for chunk in chunks:
-                if chunk.chunk_id not in unique_chunks:
-                    unique_chunks[chunk.chunk_id] = chunk
-
-        return list(unique_chunks.values())
-
     def _generate_single_paper_gap_profile(
         self,
         file_name: str,
-        context: str,
+        evidence_context: str,
     ) -> tuple[PaperGapProfile, str]:
         prompt = self._build_single_paper_gap_prompt(
             file_name=file_name,
-            context=context,
+            evidence_context=evidence_context,
         )
 
         raw_output = self.answer_generator.generate_text(prompt)
-        cleaned_output = self._strip_thinking_tags(raw_output)
-
-        try:
-            parsed_output = self._parse_json_output(cleaned_output)
-
-        except ValueError:
-            logger.warning(
-                "Gap profile for %s was not valid JSON. Attempting repair.",
-                file_name,
-            )
-
-            repaired_output = self._repair_gap_profile_to_json(
-                raw_output=cleaned_output,
+        parsed_output, parse_log = self._parse_or_repair_json(
+            raw_output=raw_output,
+            repair_builder=lambda cleaned: self._repair_gap_profile_to_json(
+                raw_output=cleaned,
                 file_name=file_name,
-            )
+            ),
+        )
 
-            repaired_cleaned = self._strip_thinking_tags(repaired_output)
-
-            try:
-                parsed_output = self._parse_json_output(repaired_cleaned)
-
-                raw_output = (
-                    raw_output
-                    + "\n\n--- JSON REPAIR OUTPUT ---\n\n"
-                    + repaired_output
-                )
-
-            except ValueError:
-                logger.warning(
-                    "JSON repair failed for %s. Using fallback profile.",
-                    file_name,
-                )
-                return self._fallback_profile(file_name=file_name), raw_output
+        raw_trace = raw_output + parse_log
 
         profile = PaperGapProfile(
             paper=str(parsed_output.get("paper", file_name)),
             problem_area=str(
                 parsed_output.get("problem_area", "Not found in retrieved context.")
             ),
-            stated_limitations=str(
-                parsed_output.get("stated_limitations", "Not found in retrieved context.")
-            ),
-            missing_or_weak_evaluation=str(
-                parsed_output.get("missing_or_weak_evaluation", "Not found in retrieved context.")
+            stated_or_implied_research_gap=str(
+                parsed_output.get(
+                    "stated_or_implied_research_gap",
+                    "Not found in retrieved context.",
+                )
             ),
             dataset_gaps=str(
                 parsed_output.get("dataset_gaps", "Not found in retrieved context.")
+            ),
+            evaluation_gaps=str(
+                parsed_output.get("evaluation_gaps", "Not found in retrieved context.")
             ),
             scalability_gaps=str(
                 parsed_output.get("scalability_gaps", "Not found in retrieved context.")
@@ -295,6 +254,9 @@ class ResearchGapFinder:
             reproducibility_gaps=str(
                 parsed_output.get("reproducibility_gaps", "Not found in retrieved context.")
             ),
+            limitations=str(
+                parsed_output.get("limitations", "Not found in retrieved context.")
+            ),
             future_work=str(
                 parsed_output.get("future_work", "Not found in retrieved context.")
             ),
@@ -303,7 +265,7 @@ class ResearchGapFinder:
             ),
         )
 
-        return profile, raw_output
+        return profile, raw_trace
 
     def _generate_cross_paper_gap_report(
         self,
@@ -316,85 +278,135 @@ class ResearchGapFinder:
         )
 
         raw_output = self.answer_generator.generate_text(prompt)
-        cleaned_output = self._strip_thinking_tags(raw_output)
-
-        try:
-            parsed_output = self._parse_json_output(cleaned_output)
-
-        except ValueError:
-            logger.warning(
-                "Cross-paper gap report was not valid JSON. Attempting repair."
-            )
-
-            repaired_output = self._repair_cross_gap_report_to_json(
-                raw_output=cleaned_output,
+        parsed_output, parse_log = self._parse_or_repair_json(
+            raw_output=raw_output,
+            repair_builder=lambda cleaned: self._repair_cross_gap_report_to_json(
+                raw_output=cleaned,
                 file_names=file_names,
+            ),
+        )
+
+        return parsed_output, raw_output + parse_log
+
+    def _format_evidence_context(
+        self,
+        evidence_packs: dict[str, EvidencePack],
+        start_index: int,
+    ) -> tuple[str, list[dict], int]:
+        context_blocks = []
+        sources = []
+
+        chunk_id_to_source_id: dict[str, str] = {}
+        chunk_id_to_fields: dict[str, set[str]] = {}
+
+        source_counter = start_index
+
+        for field_name, pack in evidence_packs.items():
+            context_blocks.append("\n" + "=" * 80)
+            context_blocks.append(f"EVIDENCE FIELD: {field_name}")
+            context_blocks.append(f"FIELD QUERY: {pack.query}")
+            context_blocks.append("=" * 80)
+
+            if not pack.evidence_chunks:
+                context_blocks.append(
+                    "No strong evidence was selected for this field."
+                )
+                continue
+
+            for chunk in pack.evidence_chunks:
+                if chunk.chunk_id not in chunk_id_to_source_id:
+                    source_id = f"Source {source_counter}"
+                    chunk_id_to_source_id[chunk.chunk_id] = source_id
+                    chunk_id_to_fields[chunk.chunk_id] = set()
+                    source_counter += 1
+
+                    sources.append(
+                        {
+                            "source_id": source_id,
+                            "paper_title": chunk.paper_title,
+                            "file_name": chunk.file_name,
+                            "page_number": chunk.page_number,
+                            "section_title": chunk.section_title,
+                            "citation": chunk.source,
+                            "chunk_id": chunk.chunk_id,
+                            "final_score": chunk.final_score,
+                            "dense_score": chunk.dense_score,
+                            "keyword_score": chunk.keyword_score,
+                            "section_score": chunk.section_score,
+                            "page_score": chunk.page_score,
+                            "noise_penalty": chunk.noise_penalty,
+                            "used_for_fields": [],
+                        }
+                    )
+
+                source_id = chunk_id_to_source_id[chunk.chunk_id]
+                chunk_id_to_fields[chunk.chunk_id].add(field_name)
+
+                context_blocks.append(
+                    (
+                        f"\n[{source_id}]\n"
+                        f"File: {chunk.file_name}\n"
+                        f"Paper: {chunk.paper_title}\n"
+                        f"Page: {chunk.page_number}\n"
+                        f"Section: {chunk.section_title}\n"
+                        f"Evidence Field: {field_name}\n"
+                        f"Evidence Score: {chunk.final_score:.4f}\n"
+                        f"Text:\n{chunk.text_preview}\n"
+                    )
+                )
+
+        for source in sources:
+            chunk_id = source["chunk_id"]
+            source["used_for_fields"] = sorted(
+                list(chunk_id_to_fields.get(chunk_id, []))
             )
 
-            repaired_cleaned = self._strip_thinking_tags(repaired_output)
-
-            try:
-                parsed_output = self._parse_json_output(repaired_cleaned)
-
-                raw_output = (
-                    raw_output
-                    + "\n\n--- JSON REPAIR OUTPUT ---\n\n"
-                    + repaired_output
-                )
-
-            except ValueError:
-                logger.warning(
-                    "Cross-paper JSON repair failed. Using fallback gap report."
-                )
-
-                parsed_output = self._fallback_cross_gap_report(
-                    file_names=file_names,
-                    paper_profiles=paper_profiles,
-                )
-
-        return parsed_output, raw_output
+        return "\n".join(context_blocks), sources, source_counter
 
     def _build_single_paper_gap_prompt(
         self,
         file_name: str,
-        context: str,
+        evidence_context: str,
     ) -> str:
         return f"""
-You are PaperMind, a research gap analysis assistant.
+You are PaperMind Research Gap Finder v2.
 
-Your task is to extract a research-gap profile for exactly one paper.
+Your task is to generate a structured research-gap profile for exactly one paper.
 
 Selected file:
 {file_name}
 
-Rules:
-1. Use only the retrieved context.
-2. Do not invent details.
-3. Every important claim should include source labels such as [Source 1], [Source 2].
-4. If information is missing, write "Not found in retrieved context."
-5. Return valid JSON only.
-6. Do not use markdown.
-7. Do not write text before or after the JSON.
-8. Your response must start with {{ and end with }}.
+Important rules:
+1. Use only the provided evidence context.
+2. Do not invent unsupported facts.
+3. Every important claim should cite source labels such as [Source 1], [Source 2].
+4. A research gap does not need an exact heading called "research gap".
+5. If a gap is implicit in the abstract, introduction, related work, results, limitations, or future work, infer it carefully and cite the supporting evidence.
+6. Separate stated limitations from inferred opportunities.
+7. Only write "Not found in retrieved context" if no supporting evidence exists.
+8. Return valid JSON only.
+9. Do not use markdown.
+10. Your response must start with {{ and end with }}.
 
 Required JSON schema:
 {{
   "paper": "{file_name}",
   "problem_area": "...",
-  "stated_limitations": "...",
-  "missing_or_weak_evaluation": "...",
+  "stated_or_implied_research_gap": "...",
   "dataset_gaps": "...",
+  "evaluation_gaps": "...",
   "scalability_gaps": "...",
   "robustness_gaps": "...",
   "reproducibility_gaps": "...",
+  "limitations": "...",
   "future_work": "...",
   "possible_research_opportunities": [
     "..."
   ]
 }}
 
-Retrieved Context:
-{context}
+Evidence Context:
+{evidence_context}
 """.strip()
 
     def _build_cross_paper_gap_prompt(
@@ -406,20 +418,20 @@ Retrieved Context:
         profiles_json = json.dumps(paper_profiles, indent=2, ensure_ascii=False)
 
         return f"""
-You are PaperMind, a research supervisor.
+You are PaperMind, acting as a research supervisor.
 
-Your task is to synthesize research gaps across multiple paper profiles.
+Your task is to synthesize research gaps across multiple structured paper profiles.
 
 Selected files:
 {selected_files}
 
 Rules:
 1. Use only the structured paper profiles below.
-2. Do not invent details.
+2. Do not invent unsupported details.
 3. Focus on actionable research opportunities.
-4. Return valid JSON only.
-5. Do not use markdown.
-6. Do not write text before or after the JSON.
+4. If only one paper is provided, generate a single-paper synthesis.
+5. Return valid JSON only.
+6. Do not use markdown.
 7. Your response must start with {{ and end with }}.
 
 Required JSON schema:
@@ -479,12 +491,13 @@ Required JSON schema:
 {{
   "paper": "{file_name}",
   "problem_area": "...",
-  "stated_limitations": "...",
-  "missing_or_weak_evaluation": "...",
+  "stated_or_implied_research_gap": "...",
   "dataset_gaps": "...",
+  "evaluation_gaps": "...",
   "scalability_gaps": "...",
   "robustness_gaps": "...",
   "reproducibility_gaps": "...",
+  "limitations": "...",
   "future_work": "...",
   "possible_research_opportunities": [
     "..."
@@ -554,48 +567,65 @@ Model output to convert:
 
         return self.answer_generator.generate_text(repair_prompt)
 
-    def _format_context_with_sources(
+    def _parse_or_repair_json(
         self,
-        chunks: list[RetrievedChunk],
-        start_index: int,
-    ) -> tuple[str, list[dict], int]:
-        context_blocks = []
-        sources = []
+        raw_output: str,
+        repair_builder,
+    ) -> tuple[dict, str]:
+        cleaned_output = self._strip_thinking_tags(raw_output)
 
-        source_index = start_index
+        try:
+            return self._parse_json_output(cleaned_output), ""
 
-        for chunk in chunks:
-            source_id = f"Source {source_index}"
+        except ValueError:
+            logger.warning("Model output was not valid JSON. Attempting repair.")
 
-            block = (
-                f"[{source_id}]\n"
-                f"Paper: {chunk.paper_title}\n"
-                f"File: {chunk.file_name}\n"
-                f"Page: {chunk.page_number}\n"
-                f"Section: {chunk.section_title}\n"
-                f"Citation: {chunk.source}\n"
-                f"Relevance Score: {chunk.relevance_score:.4f}\n"
-                f"Text:\n{chunk.text}"
-            )
+            repaired_output = repair_builder(cleaned_output)
+            repaired_cleaned = self._strip_thinking_tags(repaired_output)
 
-            context_blocks.append(block)
+            try:
+                return (
+                    self._parse_json_output(repaired_cleaned),
+                    "\n\n--- JSON REPAIR OUTPUT ---\n\n" + repaired_output,
+                )
 
-            sources.append(
-                {
-                    "source_id": source_id,
-                    "paper_title": chunk.paper_title,
-                    "file_name": chunk.file_name,
-                    "page_number": chunk.page_number,
-                    "section_title": chunk.section_title,
-                    "citation": chunk.source,
-                    "relevance_score": chunk.relevance_score,
-                    "chunk_id": chunk.chunk_id,
-                }
-            )
+            except ValueError:
+                logger.warning("JSON repair failed. Using fallback JSON.")
+                return (
+                    self._fallback_json(),
+                    "\n\n--- JSON REPAIR FAILED ---\n\n" + repaired_output,
+                )
 
-            source_index += 1
-
-        return "\n\n---\n\n".join(context_blocks), sources, source_index
+    @staticmethod
+    def _fallback_json() -> dict:
+        return {
+            "paper": "Not reliably extracted.",
+            "problem_area": "Not reliably extracted.",
+            "stated_or_implied_research_gap": "Not reliably extracted.",
+            "dataset_gaps": "Not reliably extracted.",
+            "evaluation_gaps": "Not reliably extracted.",
+            "scalability_gaps": "Not reliably extracted.",
+            "robustness_gaps": "Not reliably extracted.",
+            "reproducibility_gaps": "Not reliably extracted.",
+            "limitations": "Not reliably extracted.",
+            "future_work": "Not reliably extracted.",
+            "possible_research_opportunities": [
+                "Not reliably extracted."
+            ],
+            "common_limitations": [
+                "Not reliably extracted."
+            ],
+            "proposed_research_directions": [
+                "Not reliably extracted."
+            ],
+            "suggested_experiments": [
+                "Not reliably extracted."
+            ],
+            "suggested_ablation_studies": [
+                "Not reliably extracted."
+            ],
+            "overall_summary": "Structured gap report could not be reliably generated.",
+        }
 
     def _get_indexed_file_names(self) -> list[str]:
         vector_store = ChromaVectorStore(
@@ -624,62 +654,6 @@ Model output to convert:
         )
 
         return file_names
-
-    @staticmethod
-    def _fallback_profile(file_name: str) -> PaperGapProfile:
-        return PaperGapProfile(
-            paper=file_name,
-            problem_area="Not reliably extracted.",
-            stated_limitations="Not reliably extracted.",
-            missing_or_weak_evaluation="Not reliably extracted.",
-            dataset_gaps="Not reliably extracted.",
-            scalability_gaps="Not reliably extracted.",
-            robustness_gaps="Not reliably extracted.",
-            reproducibility_gaps="Not reliably extracted.",
-            future_work="Not reliably extracted.",
-            possible_research_opportunities=[
-                "Not reliably extracted."
-            ],
-        )
-
-    @staticmethod
-    def _fallback_cross_gap_report(
-        file_names: list[str],
-        paper_profiles: list[dict],
-    ) -> dict:
-        return {
-            "common_limitations": [
-                "Not reliably extracted."
-            ],
-            "dataset_gaps": [
-                "Not reliably extracted."
-            ],
-            "evaluation_gaps": [
-                "Not reliably extracted."
-            ],
-            "scalability_gaps": [
-                "Not reliably extracted."
-            ],
-            "robustness_gaps": [
-                "Not reliably extracted."
-            ],
-            "reproducibility_gaps": [
-                "Not reliably extracted."
-            ],
-            "proposed_research_directions": [
-                "Not reliably extracted."
-            ],
-            "suggested_experiments": [
-                "Not reliably extracted."
-            ],
-            "suggested_ablation_studies": [
-                "Not reliably extracted."
-            ],
-            "overall_summary": (
-                "Structured cross-paper research gap synthesis could not be reliably generated. "
-                "Use the paper gap profiles as the primary output."
-            ),
-        }
 
     @staticmethod
     def _strip_thinking_tags(text: str) -> str:
@@ -714,7 +688,7 @@ Model output to convert:
             ) from error
 
     @staticmethod
-    def _ensure_string_list(value) -> list[str]:
+    def _ensure_string_list(value: Any) -> list[str]:
         if value is None:
             return []
 
@@ -745,8 +719,8 @@ def gap_report_to_markdown(report: ResearchGapReport) -> str:
         "",
         "## Paper-Level Gap Profiles",
         "",
-        "| Paper | Problem Area | Stated Limitations | Weak Evaluation | Dataset Gaps | Scalability Gaps | Robustness Gaps | Reproducibility Gaps | Future Work |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| Paper | Problem Area | Research Gap | Dataset Gaps | Evaluation Gaps | Scalability Gaps | Robustness Gaps | Reproducibility Gaps | Limitations | Future Work |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
 
     for profile in report.paper_gap_profiles:
@@ -756,17 +730,19 @@ def gap_report_to_markdown(report: ResearchGapReport) -> str:
             + " | "
             + clean_markdown_cell(profile.get("problem_area", "Not found"))
             + " | "
-            + clean_markdown_cell(profile.get("stated_limitations", "Not found"))
-            + " | "
-            + clean_markdown_cell(profile.get("missing_or_weak_evaluation", "Not found"))
+            + clean_markdown_cell(profile.get("stated_or_implied_research_gap", "Not found"))
             + " | "
             + clean_markdown_cell(profile.get("dataset_gaps", "Not found"))
+            + " | "
+            + clean_markdown_cell(profile.get("evaluation_gaps", "Not found"))
             + " | "
             + clean_markdown_cell(profile.get("scalability_gaps", "Not found"))
             + " | "
             + clean_markdown_cell(profile.get("robustness_gaps", "Not found"))
             + " | "
             + clean_markdown_cell(profile.get("reproducibility_gaps", "Not found"))
+            + " | "
+            + clean_markdown_cell(profile.get("limitations", "Not found"))
             + " | "
             + clean_markdown_cell(profile.get("future_work", "Not found"))
             + " |"
@@ -796,10 +772,17 @@ def gap_report_to_markdown(report: ResearchGapReport) -> str:
     lines.extend(["", "## Sources"])
 
     for source in report.sources:
+        fields = source.get("used_for_fields", [])
+
+        if fields:
+            field_text = ", ".join(fields)
+        else:
+            field_text = "unknown"
+
         lines.append(
             f"- **{source['source_id']}**: "
             f"{source['citation']} "
-            f"(relevance={source['relevance_score']:.4f})"
+            f"(score={source.get('final_score', 0):.4f}, fields={field_text})"
         )
 
     return "\n".join(lines)
@@ -824,7 +807,21 @@ def parse_args():
         "--top-k-per-query",
         type=int,
         default=1,
-        help="Chunks retrieved per gap query per paper.",
+        help="Compact evidence chunks per evidence field.",
+    )
+
+    parser.add_argument(
+        "--candidate-top-k",
+        type=int,
+        default=20,
+        help="Number of dense retrieval candidates inspected internally.",
+    )
+
+    parser.add_argument(
+        "--max-chars-per-evidence",
+        type=int,
+        default=900,
+        help="Maximum characters per evidence chunk.",
     )
 
     parser.add_argument(
@@ -869,6 +866,8 @@ def main():
         llm_provider=args.llm_provider,
         llm_model_name=args.llm_model_name,
         temperature=args.temperature,
+        candidate_top_k=args.candidate_top_k,
+        max_chars_per_evidence=args.max_chars_per_evidence,
     )
 
     report = finder.generate(
@@ -878,7 +877,7 @@ def main():
     report_dict = report.to_dict()
     markdown = gap_report_to_markdown(report)
 
-    print("\nRESEARCH GAP REPORT")
+    print("\nRESEARCH GAP REPORT V2")
     print("=" * 100)
     print(markdown)
 
