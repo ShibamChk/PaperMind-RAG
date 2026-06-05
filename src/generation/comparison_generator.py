@@ -6,48 +6,116 @@ import argparse
 import json
 import re
 from dataclasses import dataclass, asdict
-from typing import Optional
+from typing import Optional, Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(PROJECT_ROOT))
 
-from src.retrieval.retriever import PaperRetriever, RetrievedChunk
 from src.generation.answer_generator import AnswerGenerator
-from src.config.settings import CHROMA_DB_DIR, CHROMA_COLLECTION_NAME
-from src.retrieval.vector_store import ChromaVectorStore
+from src.retrieval.evidence_builder import EvidenceBuilder, EvidencePack
 from src.utils.logger import get_logger
 
 
 logger = get_logger(__name__)
 
 
-COMPARISON_QUERIES = {
-    "problem_and_contribution": (
-        "What problem does this paper solve and what are its main contributions?"
+COMPARISON_PROFILE_FIELDS = [
+    "problem",
+    "main_contribution",
+    "method",
+    "architecture",
+    "datasets",
+    "tasks",
+    "metrics",
+    "baselines",
+    "key_results",
+    "limitations",
+    "future_work",
+]
+
+
+FIELD_TO_EVIDENCE_FIELD = {
+    "problem": "problem",
+    "main_contribution": "main_contribution",
+    "method": "method",
+    "architecture": "method",
+    "datasets": "datasets",
+    "tasks": "datasets",
+    "metrics": "metrics",
+    "baselines": "baselines",
+    "key_results": "results",
+    "limitations": "limitations",
+    "future_work": "future_work",
+}
+
+
+FIELD_INSTRUCTIONS = {
+    "problem": (
+        "Extract the problem or task the paper addresses. Focus on the research problem, "
+        "not only the model name."
     ),
-    "method_and_architecture": (
-        "What method, model architecture, algorithm, or framework does this paper propose?"
+    "main_contribution": (
+        "Extract the main contribution, novelty, or central claim of the paper."
     ),
-    "datasets_tasks_metrics": (
-        "What datasets, tasks, evaluation metrics, baselines, and experimental setup are used?"
+    "method": (
+        "Describe the proposed method, model, algorithm, or framework at a high level."
     ),
-    "results_and_findings": (
-        "What are the key results, findings, and performance comparisons reported?"
+    "architecture": (
+        "Describe important architecture components, modules, or design choices."
     ),
-    "limitations_and_future_work": (
-        "What limitations, weaknesses, conclusions, or future work are discussed?"
+    "datasets": (
+        "List datasets, benchmarks, or data sources used by the paper."
+    ),
+    "tasks": (
+        "List the tasks studied, such as node classification, link prediction, image classification, "
+        "edge prediction, segmentation, detection, or other tasks."
+    ),
+    "metrics": (
+        "List evaluation metrics used in the paper."
+    ),
+    "baselines": (
+        "List baseline methods, comparison models, or state-of-the-art methods."
+    ),
+    "key_results": (
+        "Summarize key experimental results, improvements, findings, or trade-offs."
+    ),
+    "limitations": (
+        "Extract stated limitations or cautious limitations implied by evidence."
+    ),
+    "future_work": (
+        "Extract future work or next research directions if available."
     ),
 }
 
 
 @dataclass
-class PaperComparison:
+class PaperComparisonProfile:
+    paper: str
+    problem: str
+    main_contribution: str
+    method: str
+    architecture: str
+    datasets: str
+    tasks: str
+    metrics: str
+    baselines: str
+    key_results: str
+    limitations: str
+    future_work: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class MultiPaperComparison:
     compared_files: list[str]
-    comparison_table: list[dict]
+    comparison_profiles: list[dict]
     cross_paper_summary: str
     key_similarities: list[str]
     key_differences: list[str]
     research_gaps: list[str]
+    practical_takeaways: list[str]
     sources: list[dict]
     llm_provider: str
     model_name: str
@@ -57,29 +125,33 @@ class PaperComparison:
         return asdict(self)
 
 
-class MultiPaperComparisonGenerator:
+class ComparisonGenerator:
     """
-    Generates a multi-paper comparison matrix.
+    Multi-Paper Comparison v2.
 
-    Improved design:
-        1. Retrieve evidence separately for each paper.
-        2. Generate one structured row per paper.
-        3. Compare the generated rows.
+    v1 compared papers using direct vector retrieval and a large mixed prompt.
+    v2 uses EvidenceBuilder and creates one structured profile per paper first.
 
-    This prevents the LLM from ignoring one paper when multiple papers are mixed
-    into one large prompt.
+    This reduces the chance that:
+        - one paper dominates the comparison
+        - another paper becomes "Not found"
+        - unrelated evidence from different papers gets mixed
     """
 
     def __init__(
         self,
-        top_k_per_query: int = 2,
+        top_k_per_query: int = 1,
         llm_provider: Optional[str] = None,
         llm_model_name: Optional[str] = None,
-        temperature: float = 0.1,
+        temperature: float = 0.2,
+        candidate_top_k: int = 20,
+        max_chars_per_evidence: int = 800,
     ):
-        self.top_k_per_query = top_k_per_query
+        self.max_evidence_per_field = top_k_per_query
+        self.candidate_top_k = candidate_top_k
+        self.max_chars_per_evidence = max_chars_per_evidence
 
-        self.retriever = PaperRetriever()
+        self.evidence_builder = EvidenceBuilder()
 
         self.answer_generator = AnswerGenerator(
             provider=llm_provider,
@@ -89,72 +161,63 @@ class MultiPaperComparisonGenerator:
 
     def generate(
         self,
-        file_names: Optional[list[str]] = None,
-    ) -> PaperComparison:
-        if file_names is None or len(file_names) == 0:
-            file_names = self._get_indexed_file_names()
+        file_names: list[str],
+    ) -> MultiPaperComparison:
+        if not file_names or len(file_names) < 2:
+            raise ValueError("Please provide at least two file names for comparison.")
 
-        file_names = sorted(list(set(file_names)))
+        file_names = list(dict.fromkeys(file_names))
 
-        if len(file_names) < 2:
-            logger.warning(
-                "Only %s paper(s) selected. Multi-paper comparison is more useful with at least 2 papers.",
-                len(file_names),
-            )
-
-        comparison_rows = []
+        all_profiles = []
         all_sources = []
         raw_outputs = []
 
         source_counter = 1
 
         for file_name in file_names:
-            logger.info("Generating comparison row for paper: %s", file_name)
+            logger.info("Generating comparison profile for: %s", file_name)
 
-            chunks = self._retrieve_evidence_for_file(file_name=file_name)
-
-            if not chunks:
-                logger.warning("No chunks found for %s", file_name)
-                comparison_rows.append(self._fallback_row(file_name=file_name))
-                continue
-
-            context, sources, source_counter = self._format_context_with_sources(
-                chunks=chunks,
-                start_index=source_counter,
-            )
-
-            all_sources.extend(sources)
-
-            row, raw_output = self._generate_single_paper_row(
+            profile, sources, source_counter, raw_trace = self._generate_single_paper_profile(
                 file_name=file_name,
-                context=context,
+                source_counter=source_counter,
             )
 
-            comparison_rows.append(row)
-            raw_outputs.append(f"\n\n--- RAW OUTPUT FOR {file_name} ---\n{raw_output}")
+            all_profiles.append(profile.to_dict())
+            all_sources.extend(sources)
+            raw_outputs.append(
+                f"\n\n--- RAW PROFILE OUTPUT FOR {file_name} ---\n{raw_trace}"
+            )
 
-        cross_analysis, cross_raw_output = self._generate_cross_paper_analysis(
-            comparison_rows=comparison_rows,
+        comparison_summary, raw_summary_output = self._generate_cross_paper_comparison(
+            profiles=all_profiles,
             file_names=file_names,
         )
 
-        raw_outputs.append("\n\n--- RAW CROSS-PAPER OUTPUT ---\n" + cross_raw_output)
+        raw_outputs.append(
+            "\n\n--- RAW CROSS-PAPER COMPARISON OUTPUT ---\n"
+            + raw_summary_output
+        )
 
-        return PaperComparison(
+        return MultiPaperComparison(
             compared_files=file_names,
-            comparison_table=comparison_rows,
-            cross_paper_summary=cross_analysis.get(
-                "cross_paper_summary",
-                "Not found in retrieved context.",
+            comparison_profiles=all_profiles,
+            cross_paper_summary=str(
+                comparison_summary.get(
+                    "cross_paper_summary",
+                    "Not found in retrieved context.",
+                )
             ),
             key_similarities=self._ensure_string_list(
-                cross_analysis.get("key_similarities", [])
+                comparison_summary.get("key_similarities", [])
             ),
             key_differences=self._ensure_string_list(
-                cross_analysis.get("key_differences", [])
+                comparison_summary.get("key_differences", [])
             ),
             research_gaps=self._ensure_string_list(
-                cross_analysis.get("research_gaps", [])
+                comparison_summary.get("research_gaps", [])
+            ),
+            practical_takeaways=self._ensure_string_list(
+                comparison_summary.get("practical_takeaways", [])
             ),
             sources=all_sources,
             llm_provider=self.answer_generator.provider,
@@ -162,93 +225,367 @@ class MultiPaperComparisonGenerator:
             raw_model_output="\n".join(raw_outputs),
         )
 
-    def _retrieve_evidence_for_file(
+    def _generate_single_paper_profile(
         self,
         file_name: str,
-    ) -> list[RetrievedChunk]:
-        unique_chunks = {}
+        source_counter: int,
+    ) -> tuple[PaperComparisonProfile, list[dict], int, str]:
+        needed_evidence_fields = sorted(set(FIELD_TO_EVIDENCE_FIELD.values()))
 
-        for query_name, query in COMPARISON_QUERIES.items():
-            logger.info("  Query dimension: %s", query_name)
+        evidence_packs = self.evidence_builder.build_multiple_evidence_packs(
+            file_name=file_name,
+            field_names=needed_evidence_fields,
+            candidate_top_k=self.candidate_top_k,
+            max_evidence_chunks=self.max_evidence_per_field,
+            max_chars_per_chunk=self.max_chars_per_evidence,
+        )
 
-            chunks = self.retriever.search(
-                query=query,
-                top_k=self.top_k_per_query,
+        sources, chunk_id_to_source_id, next_source_counter = self._collect_sources(
+            evidence_packs=evidence_packs,
+            start_index=source_counter,
+        )
+
+        field_answers = {}
+        raw_outputs = []
+
+        for profile_field in COMPARISON_PROFILE_FIELDS:
+            evidence_field = FIELD_TO_EVIDENCE_FIELD[profile_field]
+            evidence_pack = evidence_packs[evidence_field]
+
+            answer, raw_trace = self._generate_profile_field(
                 file_name=file_name,
+                profile_field=profile_field,
+                evidence_pack=evidence_pack,
+                chunk_id_to_source_id=chunk_id_to_source_id,
             )
 
-            for chunk in chunks:
-                if chunk.chunk_id not in unique_chunks:
-                    unique_chunks[chunk.chunk_id] = chunk
+            field_answers[profile_field] = answer
+            raw_outputs.append(
+                f"\n\n--- RAW FIELD OUTPUT FOR {file_name} / {profile_field} ---\n{raw_trace}"
+            )
 
-        return list(unique_chunks.values())
+        profile = PaperComparisonProfile(
+            paper=file_name,
+            problem=field_answers.get("problem", "Not found in retrieved context."),
+            main_contribution=field_answers.get("main_contribution", "Not found in retrieved context."),
+            method=field_answers.get("method", "Not found in retrieved context."),
+            architecture=field_answers.get("architecture", "Not found in retrieved context."),
+            datasets=field_answers.get("datasets", "Not found in retrieved context."),
+            tasks=field_answers.get("tasks", "Not found in retrieved context."),
+            metrics=field_answers.get("metrics", "Not found in retrieved context."),
+            baselines=field_answers.get("baselines", "Not found in retrieved context."),
+            key_results=field_answers.get("key_results", "Not found in retrieved context."),
+            limitations=field_answers.get("limitations", "Not found in retrieved context."),
+            future_work=field_answers.get("future_work", "Not found in retrieved context."),
+        )
 
-    def _generate_single_paper_row(
+        return profile, sources, next_source_counter, "\n".join(raw_outputs)
+
+    def _generate_profile_field(
         self,
         file_name: str,
-        context: str,
-    ) -> tuple[dict, str]:
-        prompt = self._build_single_paper_row_prompt(
+        profile_field: str,
+        evidence_pack: EvidencePack,
+        chunk_id_to_source_id: dict[str, str],
+    ) -> tuple[str, str]:
+        evidence_context = self._format_evidence_context(
+            evidence_pack=evidence_pack,
+            chunk_id_to_source_id=chunk_id_to_source_id,
+        )
+
+        prompt = self._build_profile_field_prompt(
             file_name=file_name,
-            context=context,
+            profile_field=profile_field,
+            evidence_context=evidence_context,
         )
 
         raw_output = self.answer_generator.generate_text(prompt)
-        cleaned_output = self._strip_thinking_tags(raw_output)
 
-        try:
-            parsed_row = self._parse_json_output(cleaned_output)
+        parsed_output, parse_log = self._parse_or_repair_field_json(
+            raw_output=raw_output,
+            profile_field=profile_field,
+        )
 
-        except ValueError:
-            logger.warning(
-                "Single-paper row for %s was not valid JSON. Attempting repair.",
+        answer = self._as_string(
+            parsed_output.get(
+                profile_field,
+                "Not found in retrieved context.",
+            )
+        )
+
+        raw_trace = raw_output + parse_log
+
+        if self._should_retry_answer(answer, evidence_pack):
+            logger.info(
+                "Retrying comparison field '%s' for paper '%s'.",
+                profile_field,
                 file_name,
             )
 
-            repaired_output = self._repair_row_output_to_json(
-                raw_output=cleaned_output,
+            retry_prompt = self._build_retry_profile_field_prompt(
                 file_name=file_name,
+                profile_field=profile_field,
+                evidence_context=evidence_context,
+            )
+
+            retry_raw_output = self.answer_generator.generate_text(retry_prompt)
+
+            retry_parsed, retry_parse_log = self._parse_or_repair_field_json(
+                raw_output=retry_raw_output,
+                profile_field=profile_field,
+            )
+
+            retry_answer = self._as_string(
+                retry_parsed.get(
+                    profile_field,
+                    "Not found in retrieved context.",
+                )
+            )
+
+            raw_trace += (
+                "\n\n--- RETRY RAW OUTPUT ---\n"
+                + retry_raw_output
+                + retry_parse_log
+            )
+
+            if not self._is_not_found_answer(retry_answer):
+                answer = retry_answer
+
+        return answer, raw_trace
+
+    def _generate_cross_paper_comparison(
+        self,
+        profiles: list[dict],
+        file_names: list[str],
+    ) -> tuple[dict, str]:
+        prompt = self._build_cross_paper_prompt(
+            profiles=profiles,
+            file_names=file_names,
+        )
+
+        raw_output = self.answer_generator.generate_text(prompt)
+
+        parsed_output, parse_log = self._parse_or_repair_cross_json(
+            raw_output=raw_output,
+            file_names=file_names,
+        )
+
+        return parsed_output, raw_output + parse_log
+
+    @staticmethod
+    def _format_evidence_context(
+        evidence_pack: EvidencePack,
+        chunk_id_to_source_id: dict[str, str],
+    ) -> str:
+        if not evidence_pack.evidence_chunks:
+            return "No strong evidence was selected for this field."
+
+        blocks = []
+
+        for chunk in evidence_pack.evidence_chunks:
+            source_id = chunk_id_to_source_id.get(chunk.chunk_id, "Source Unknown")
+
+            blocks.append(
+                (
+                    f"[{source_id}]\n"
+                    f"File: {chunk.file_name}\n"
+                    f"Paper: {chunk.paper_title}\n"
+                    f"Page: {chunk.page_number}\n"
+                    f"Section: {chunk.section_title}\n"
+                    f"Evidence Field: {evidence_pack.field_name}\n"
+                    f"Evidence Score: {chunk.final_score:.4f}\n"
+                    f"Text:\n{chunk.text_preview}\n"
+                )
+            )
+
+        return "\n\n---\n\n".join(blocks)
+
+    def _build_profile_field_prompt(
+        self,
+        file_name: str,
+        profile_field: str,
+        evidence_context: str,
+    ) -> str:
+        instruction = FIELD_INSTRUCTIONS.get(
+            profile_field,
+            "Extract the requested comparison field from the evidence.",
+        )
+
+        return f"""
+You are PaperMind Multi-Paper Comparison v2.
+
+Your task is to generate exactly one structured comparison-profile field for one paper.
+
+Selected file:
+{file_name}
+
+Target field:
+{profile_field}
+
+Field instruction:
+{instruction}
+
+Rules:
+1. Use only the provided evidence context.
+2. Do not invent unsupported facts.
+3. Every important claim should cite source labels such as [Source 1], [Source 2].
+4. A field does not need an exact heading in the paper.
+5. If the answer is implicit, infer cautiously from the evidence and cite it.
+6. Only write "Not found in retrieved context" if the evidence is empty or truly unrelated.
+7. Keep the answer concise but useful.
+8. Return valid JSON only.
+9. Do not use markdown.
+10. Your response must start with {{ and end with }}.
+
+Required JSON schema:
+{{
+  "{profile_field}": "..."
+}}
+
+Evidence Context:
+{evidence_context}
+""".strip()
+
+    def _build_retry_profile_field_prompt(
+        self,
+        file_name: str,
+        profile_field: str,
+        evidence_context: str,
+    ) -> str:
+        instruction = FIELD_INSTRUCTIONS.get(
+            profile_field,
+            "Extract the requested comparison field from the evidence.",
+        )
+
+        return f"""
+You are PaperMind Multi-Paper Comparison v2.
+
+The previous answer was missing or weak.
+Re-read the evidence carefully and extract the requested field if any support exists.
+
+Selected file:
+{file_name}
+
+Target field:
+{profile_field}
+
+Field instruction:
+{instruction}
+
+Strict rules:
+1. Use only the evidence context.
+2. Cite source labels such as [Source 1], [Source 2].
+3. Do not invent unsupported facts.
+4. If the evidence includes datasets, metrics, baselines, results, or future work, extract them directly.
+5. Do not write "Not found in retrieved context" unless the evidence is completely unrelated.
+6. Return valid JSON only.
+7. Do not use markdown.
+8. Your response must start with {{ and end with }}.
+
+Required JSON schema:
+{{
+  "{profile_field}": "..."
+}}
+
+Evidence Context:
+{evidence_context}
+""".strip()
+
+    def _build_cross_paper_prompt(
+        self,
+        profiles: list[dict],
+        file_names: list[str],
+    ) -> str:
+        selected_files = ", ".join(file_names)
+        profiles_json = json.dumps(profiles, indent=2, ensure_ascii=False)
+
+        return f"""
+You are PaperMind Multi-Paper Comparison v2.
+
+Your task is to compare multiple papers using their structured profiles.
+
+Selected files:
+{selected_files}
+
+Rules:
+1. Use only the structured paper profiles below.
+2. Do not invent details not present in the profiles.
+3. Compare papers across problem, contribution, method, datasets, metrics, results, limitations, and future work.
+4. If a profile field is missing, acknowledge the limitation instead of hallucinating.
+5. Return valid JSON only.
+6. Do not use markdown.
+7. Your response must start with {{ and end with }}.
+
+Required JSON schema:
+{{
+  "cross_paper_summary": "...",
+  "key_similarities": [
+    "..."
+  ],
+  "key_differences": [
+    "..."
+  ],
+  "research_gaps": [
+    "..."
+  ],
+  "practical_takeaways": [
+    "..."
+  ]
+}}
+
+Structured paper profiles:
+{profiles_json}
+""".strip()
+
+    def _parse_or_repair_field_json(
+        self,
+        raw_output: str,
+        profile_field: str,
+    ) -> tuple[dict, str]:
+        cleaned_output = self._strip_thinking_tags(raw_output)
+
+        try:
+            return self._parse_json_output(cleaned_output), ""
+
+        except ValueError:
+            logger.warning(
+                "Comparison profile field '%s' output was not valid JSON. Attempting repair.",
+                profile_field,
+            )
+
+            repaired_output = self._repair_field_to_json(
+                raw_output=cleaned_output,
+                profile_field=profile_field,
             )
 
             repaired_cleaned = self._strip_thinking_tags(repaired_output)
 
             try:
-                parsed_row = self._parse_json_output(repaired_cleaned)
-                raw_output = (
-                    raw_output
-                    + "\n\n--- JSON REPAIR OUTPUT ---\n\n"
-                    + repaired_output
+                return (
+                    self._parse_json_output(repaired_cleaned),
+                    "\n\n--- JSON REPAIR OUTPUT ---\n" + repaired_output,
                 )
 
             except ValueError:
-                logger.warning(
-                    "JSON repair failed for %s. Using fallback row.",
-                    file_name,
+                return (
+                    {profile_field: "Not reliably extracted."},
+                    "\n\n--- JSON REPAIR FAILED ---\n" + repaired_output,
                 )
-                parsed_row = self._fallback_row(file_name=file_name)
 
-        return self._normalize_row(parsed_row, file_name=file_name), raw_output
-
-    def _generate_cross_paper_analysis(
+    def _parse_or_repair_cross_json(
         self,
-        comparison_rows: list[dict],
+        raw_output: str,
         file_names: list[str],
     ) -> tuple[dict, str]:
-        prompt = self._build_cross_paper_prompt(
-            comparison_rows=comparison_rows,
-            file_names=file_names,
-        )
-
-        raw_output = self.answer_generator.generate_text(prompt)
         cleaned_output = self._strip_thinking_tags(raw_output)
 
         try:
-            parsed_output = self._parse_json_output(cleaned_output)
+            return self._parse_json_output(cleaned_output), ""
 
         except ValueError:
-            logger.warning("Cross-paper output was not valid JSON. Attempting repair.")
+            logger.warning("Cross-paper comparison output was not valid JSON. Attempting repair.")
 
-            repaired_output = self._repair_cross_output_to_json(
+            repaired_output = self._repair_cross_to_json(
                 raw_output=cleaned_output,
                 file_names=file_names,
             )
@@ -256,88 +593,66 @@ class MultiPaperComparisonGenerator:
             repaired_cleaned = self._strip_thinking_tags(repaired_output)
 
             try:
-                parsed_output = self._parse_json_output(repaired_cleaned)
-                raw_output = (
-                    raw_output
-                    + "\n\n--- JSON REPAIR OUTPUT ---\n\n"
-                    + repaired_output
+                return (
+                    self._parse_json_output(repaired_cleaned),
+                    "\n\n--- JSON REPAIR OUTPUT ---\n" + repaired_output,
                 )
 
             except ValueError:
-                logger.warning("Cross-paper JSON repair failed. Using fallback.")
-                parsed_output = self._fallback_cross_analysis(
-                    comparison_rows=comparison_rows,
-                    file_names=file_names,
+                return (
+                    {
+                        "cross_paper_summary": "Not reliably extracted.",
+                        "key_similarities": ["Not reliably extracted."],
+                        "key_differences": ["Not reliably extracted."],
+                        "research_gaps": ["Not reliably extracted."],
+                        "practical_takeaways": ["Not reliably extracted."],
+                    },
+                    "\n\n--- JSON REPAIR FAILED ---\n" + repaired_output,
                 )
 
-        return parsed_output, raw_output
-
-    def _build_single_paper_row_prompt(
+    def _repair_field_to_json(
         self,
-        file_name: str,
-        context: str,
+        raw_output: str,
+        profile_field: str,
     ) -> str:
-        return f"""
-You are PaperMind, a research-paper analysis assistant.
-
-Your task is to extract one structured comparison row for exactly one paper.
-
-Selected file:
-{file_name}
+        repair_prompt = f"""
+Convert the following model output into valid JSON only.
 
 Rules:
-1. Use only the retrieved context.
-2. Do not invent details.
-3. Every important claim should include source labels such as [Source 1], [Source 2].
-4. If information is missing, write "Not found in retrieved context."
-5. Return valid JSON only.
-6. Do not use markdown.
-7. Do not write text before or after the JSON.
-8. Your response must start with {{ and end with }}.
+1. Your response must start with {{ and end with }}.
+2. Do not use markdown.
+3. Do not explain anything.
+4. If the answer is missing, use "Not found in retrieved context."
 
 Required JSON schema:
 {{
-  "paper": "{file_name}",
-  "problem": "...",
-  "main_contribution": "...",
-  "method": "...",
-  "architecture_or_framework": "...",
-  "datasets": "...",
-  "tasks": "...",
-  "evaluation_metrics": "...",
-  "baselines": "...",
-  "key_results": "...",
-  "limitations": "...",
-  "unique_strength": "..."
+  "{profile_field}": "..."
 }}
 
-Retrieved Context:
-{context}
+Model output to convert:
+{raw_output}
 """.strip()
 
-    def _build_cross_paper_prompt(
+        return self.answer_generator.generate_text(repair_prompt)
+
+    def _repair_cross_to_json(
         self,
-        comparison_rows: list[dict],
+        raw_output: str,
         file_names: list[str],
     ) -> str:
         selected_files = ", ".join(file_names)
-        rows_json = json.dumps(comparison_rows, indent=2, ensure_ascii=False)
 
-        return f"""
-You are PaperMind, a research-paper comparison assistant.
-
-Your task is to compare the structured rows for multiple papers.
+        repair_prompt = f"""
+Convert the following model output into valid JSON only.
 
 Selected files:
 {selected_files}
 
 Rules:
-1. Use only the structured rows provided below.
-2. Do not invent details.
-3. Return valid JSON only.
-4. Do not use markdown.
-5. Do not write text before or after the JSON.
-6. Your response must start with {{ and end with }}.
+1. Your response must start with {{ and end with }}.
+2. Do not use markdown.
+3. Do not explain anything.
+4. If a field is missing, use "Not reliably extracted."
 
 Required JSON schema:
 {{
@@ -350,81 +665,8 @@ Required JSON schema:
   ],
   "research_gaps": [
     "..."
-  ]
-}}
-
-Structured comparison rows:
-{rows_json}
-""".strip()
-
-    def _repair_row_output_to_json(
-        self,
-        raw_output: str,
-        file_name: str,
-    ) -> str:
-        repair_prompt = f"""
-Convert the following model output into valid JSON only.
-
-Rules:
-1. Your response must start with {{ and end with }}.
-2. Do not use markdown.
-3. Do not explain anything.
-4. If a field is missing, use "Not found in retrieved context."
-
-Selected file:
-{file_name}
-
-Required JSON schema:
-{{
-  "paper": "{file_name}",
-  "problem": "...",
-  "main_contribution": "...",
-  "method": "...",
-  "architecture_or_framework": "...",
-  "datasets": "...",
-  "tasks": "...",
-  "evaluation_metrics": "...",
-  "baselines": "...",
-  "key_results": "...",
-  "limitations": "...",
-  "unique_strength": "..."
-}}
-
-Model output to convert:
-{raw_output}
-""".strip()
-
-        return self.answer_generator.generate_text(repair_prompt)
-
-    def _repair_cross_output_to_json(
-        self,
-        raw_output: str,
-        file_names: list[str],
-    ) -> str:
-        selected_files = ", ".join(file_names)
-
-        repair_prompt = f"""
-Convert the following model output into valid JSON only.
-
-Rules:
-1. Your response must start with {{ and end with }}.
-2. Do not use markdown.
-3. Do not explain anything.
-4. If a field is missing, use "Not found in retrieved context."
-
-Selected files:
-{selected_files}
-
-Required JSON schema:
-{{
-  "cross_paper_summary": "...",
-  "key_similarities": [
-    "..."
   ],
-  "key_differences": [
-    "..."
-  ],
-  "research_gaps": [
+  "practical_takeaways": [
     "..."
   ]
 }}
@@ -435,146 +677,81 @@ Model output to convert:
 
         return self.answer_generator.generate_text(repair_prompt)
 
-    def _format_context_with_sources(
-        self,
-        chunks: list[RetrievedChunk],
-        start_index: int,
-    ) -> tuple[str, list[dict], int]:
-        context_blocks = []
-        sources = []
+    @staticmethod
+    def _should_retry_answer(
+        answer: str,
+        evidence_pack: EvidencePack,
+    ) -> bool:
+        if not evidence_pack.evidence_chunks:
+            return False
 
-        source_index = start_index
-
-        for chunk in chunks:
-            source_id = f"Source {source_index}"
-
-            block = (
-                f"[{source_id}]\n"
-                f"Paper: {chunk.paper_title}\n"
-                f"File: {chunk.file_name}\n"
-                f"Page: {chunk.page_number}\n"
-                f"Section: {chunk.section_title}\n"
-                f"Citation: {chunk.source}\n"
-                f"Relevance Score: {chunk.relevance_score:.4f}\n"
-                f"Text:\n{chunk.text}"
-            )
-
-            context_blocks.append(block)
-
-            sources.append(
-                {
-                    "source_id": source_id,
-                    "paper_title": chunk.paper_title,
-                    "file_name": chunk.file_name,
-                    "page_number": chunk.page_number,
-                    "section_title": chunk.section_title,
-                    "citation": chunk.source,
-                    "relevance_score": chunk.relevance_score,
-                    "chunk_id": chunk.chunk_id,
-                }
-            )
-
-            source_index += 1
-
-        return "\n\n---\n\n".join(context_blocks), sources, source_index
-
-    def _get_indexed_file_names(self) -> list[str]:
-        vector_store = ChromaVectorStore(
-            persist_dir=CHROMA_DB_DIR,
-            collection_name=CHROMA_COLLECTION_NAME,
-        )
-
-        collection_count = vector_store.count()
-
-        if collection_count == 0:
-            raise RuntimeError("Vector store is empty. Build the vector store first.")
-
-        results = vector_store.collection.get(
-            include=["metadatas"],
-            limit=collection_count,
-        )
-
-        metadatas = results.get("metadatas", [])
-
-        file_names = sorted(
-            {
-                metadata.get("file_name")
-                for metadata in metadatas
-                if metadata.get("file_name")
-            }
-        )
-
-        return file_names
+        return ComparisonGenerator._is_not_found_answer(answer)
 
     @staticmethod
-    def _fallback_row(file_name: str) -> dict:
-        return {
-            "paper": file_name,
-            "problem": "Not reliably extracted.",
-            "main_contribution": "Not reliably extracted.",
-            "method": "Not reliably extracted.",
-            "architecture_or_framework": "Not reliably extracted.",
-            "datasets": "Not reliably extracted.",
-            "tasks": "Not reliably extracted.",
-            "evaluation_metrics": "Not reliably extracted.",
-            "baselines": "Not reliably extracted.",
-            "key_results": "Not reliably extracted.",
-            "limitations": "Not reliably extracted.",
-            "unique_strength": "Not reliably extracted.",
-        }
+    def _is_not_found_answer(answer: str) -> bool:
+        normalized = answer.lower().strip()
 
-    @staticmethod
-    def _fallback_cross_analysis(
-        comparison_rows: list[dict],
-        file_names: list[str],
-    ) -> dict:
-        return {
-            "cross_paper_summary": (
-                "Structured cross-paper analysis could not be reliably generated. "
-                "Use the comparison table rows as the primary output."
-            ),
-            "key_similarities": [
-                "Not reliably extracted."
-            ],
-            "key_differences": [
-                "Not reliably extracted."
-            ],
-            "research_gaps": [
-                "Not reliably extracted."
-            ],
-        }
-
-    @staticmethod
-    def _normalize_row(row: dict, file_name: str) -> dict:
-        required_keys = [
-            "paper",
-            "problem",
-            "main_contribution",
-            "method",
-            "architecture_or_framework",
-            "datasets",
-            "tasks",
-            "evaluation_metrics",
-            "baselines",
-            "key_results",
-            "limitations",
-            "unique_strength",
+        patterns = [
+            "not found",
+            "not discussed",
+            "not provided",
+            "not mentioned",
+            "not available",
+            "not reliably extracted",
+            "no supporting evidence",
         ]
 
-        normalized = {}
+        return any(pattern in normalized for pattern in patterns)
 
-        for key in required_keys:
-            value = row.get(key, "Not found in retrieved context.")
+    @staticmethod
+    def _collect_sources(
+        evidence_packs: dict[str, EvidencePack],
+        start_index: int = 1,
+    ) -> tuple[list[dict], dict[str, str], int]:
+        chunk_id_to_source: dict[str, dict] = {}
+        chunk_id_to_fields: dict[str, set[str]] = {}
+        chunk_id_to_source_id: dict[str, str] = {}
 
-            if isinstance(value, (list, dict)):
-                value = json.dumps(value, ensure_ascii=False)
+        source_counter = start_index
 
-            normalized[key] = str(value)
+        for field_name, pack in evidence_packs.items():
+            for chunk in pack.evidence_chunks:
+                if chunk.chunk_id not in chunk_id_to_source:
+                    source_id = f"Source {source_counter}"
+                    source_counter += 1
 
-        if not normalized["paper"] or normalized["paper"] == "Not found in retrieved context.":
-            normalized["paper"] = file_name
+                    chunk_id_to_source_id[chunk.chunk_id] = source_id
 
-        return normalized
+                    chunk_id_to_source[chunk.chunk_id] = {
+                        "source_id": source_id,
+                        "paper_title": chunk.paper_title,
+                        "file_name": chunk.file_name,
+                        "page_number": chunk.page_number,
+                        "section_title": chunk.section_title,
+                        "citation": chunk.source,
+                        "chunk_id": chunk.chunk_id,
+                        "final_score": chunk.final_score,
+                        "dense_score": chunk.dense_score,
+                        "keyword_score": chunk.keyword_score,
+                        "section_score": chunk.section_score,
+                        "page_score": chunk.page_score,
+                        "noise_penalty": chunk.noise_penalty,
+                        "used_for_fields": [],
+                    }
+
+                    chunk_id_to_fields[chunk.chunk_id] = set()
+
+                chunk_id_to_fields[chunk.chunk_id].add(field_name)
+
+        sources = list(chunk_id_to_source.values())
+
+        for source in sources:
+            chunk_id = source["chunk_id"]
+            source["used_for_fields"] = sorted(
+                list(chunk_id_to_fields.get(chunk_id, []))
+            )
+
+        return sources, chunk_id_to_source_id, source_counter
 
     @staticmethod
     def _strip_thinking_tags(text: str) -> str:
@@ -609,7 +786,7 @@ Model output to convert:
             ) from error
 
     @staticmethod
-    def _ensure_string_list(value) -> list[str]:
+    def _ensure_string_list(value: Any) -> list[str]:
         if value is None:
             return []
 
@@ -618,8 +795,21 @@ Model output to convert:
 
         return [str(value)]
 
+    @staticmethod
+    def _as_string(value: Any) -> str:
+        if value is None:
+            return "Not found in retrieved context."
 
-def clean_markdown_cell(value) -> str:
+        if isinstance(value, list):
+            return ", ".join(str(item) for item in value)
+
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+
+        return str(value).strip()
+
+
+def clean_markdown_cell(value: Any) -> str:
     text = str(value)
     text = text.replace("\n", " ")
     text = text.replace("|", "/")
@@ -627,7 +817,7 @@ def clean_markdown_cell(value) -> str:
     return text.strip()
 
 
-def comparison_to_markdown(comparison: PaperComparison) -> str:
+def comparison_to_markdown(comparison: MultiPaperComparison) -> str:
     lines = [
         "# Multi-Paper Comparison Matrix",
         "",
@@ -637,36 +827,36 @@ def comparison_to_markdown(comparison: PaperComparison) -> str:
         "",
         "## Comparison Table",
         "",
-        "| Paper | Problem | Main Contribution | Method | Architecture / Framework | Datasets | Tasks | Metrics | Baselines | Key Results | Limitations | Unique Strength |",
+        "| Paper | Problem | Main Contribution | Method | Architecture | Datasets | Tasks | Metrics | Baselines | Key Results | Limitations | Future Work |",
         "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
 
-    for row in comparison.comparison_table:
+    for profile in comparison.comparison_profiles:
         lines.append(
             "| "
-            + clean_markdown_cell(row.get("paper", "Not found"))
+            + clean_markdown_cell(profile.get("paper", "Not found"))
             + " | "
-            + clean_markdown_cell(row.get("problem", "Not found"))
+            + clean_markdown_cell(profile.get("problem", "Not found"))
             + " | "
-            + clean_markdown_cell(row.get("main_contribution", "Not found"))
+            + clean_markdown_cell(profile.get("main_contribution", "Not found"))
             + " | "
-            + clean_markdown_cell(row.get("method", "Not found"))
+            + clean_markdown_cell(profile.get("method", "Not found"))
             + " | "
-            + clean_markdown_cell(row.get("architecture_or_framework", "Not found"))
+            + clean_markdown_cell(profile.get("architecture", "Not found"))
             + " | "
-            + clean_markdown_cell(row.get("datasets", "Not found"))
+            + clean_markdown_cell(profile.get("datasets", "Not found"))
             + " | "
-            + clean_markdown_cell(row.get("tasks", "Not found"))
+            + clean_markdown_cell(profile.get("tasks", "Not found"))
             + " | "
-            + clean_markdown_cell(row.get("evaluation_metrics", "Not found"))
+            + clean_markdown_cell(profile.get("metrics", "Not found"))
             + " | "
-            + clean_markdown_cell(row.get("baselines", "Not found"))
+            + clean_markdown_cell(profile.get("baselines", "Not found"))
             + " | "
-            + clean_markdown_cell(row.get("key_results", "Not found"))
+            + clean_markdown_cell(profile.get("key_results", "Not found"))
             + " | "
-            + clean_markdown_cell(row.get("limitations", "Not found"))
+            + clean_markdown_cell(profile.get("limitations", "Not found"))
             + " | "
-            + clean_markdown_cell(row.get("unique_strength", "Not found"))
+            + clean_markdown_cell(profile.get("future_work", "Not found"))
             + " |"
         )
 
@@ -680,35 +870,34 @@ def comparison_to_markdown(comparison: PaperComparison) -> str:
         ]
     )
 
-    if comparison.key_similarities:
-        for item in comparison.key_similarities:
-            lines.append(f"- {item}")
-    else:
-        lines.append("- Not found in retrieved context.")
+    for item in comparison.key_similarities:
+        lines.append(f"- {item}")
 
     lines.extend(["", "## Key Differences"])
 
-    if comparison.key_differences:
-        for item in comparison.key_differences:
-            lines.append(f"- {item}")
-    else:
-        lines.append("- Not found in retrieved context.")
+    for item in comparison.key_differences:
+        lines.append(f"- {item}")
 
     lines.extend(["", "## Research Gaps"])
 
-    if comparison.research_gaps:
-        for item in comparison.research_gaps:
-            lines.append(f"- {item}")
-    else:
-        lines.append("- Not found in retrieved context.")
+    for item in comparison.research_gaps:
+        lines.append(f"- {item}")
+
+    lines.extend(["", "## Practical Takeaways"])
+
+    for item in comparison.practical_takeaways:
+        lines.append(f"- {item}")
 
     lines.extend(["", "## Sources"])
 
     for source in comparison.sources:
+        fields = source.get("used_for_fields", [])
+        field_text = ", ".join(fields) if fields else "unknown"
+
         lines.append(
             f"- **{source['source_id']}**: "
             f"{source['citation']} "
-            f"(relevance={source['relevance_score']:.4f})"
+            f"(score={source.get('final_score', 0):.4f}, fields={field_text})"
         )
 
     return "\n".join(lines)
@@ -716,24 +905,35 @@ def comparison_to_markdown(comparison: PaperComparison) -> str:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Generate a multi-paper comparison matrix."
+        description="Generate multi-paper comparison matrix from indexed research papers."
     )
 
     parser.add_argument(
         "--file-names",
-        nargs="*",
-        default=None,
-        help=(
-            "Optional list of exact file names to compare. "
-            "Example: --file-names evolvegc.pdf dysat.pdf"
-        ),
+        nargs="+",
+        required=True,
+        help="Exact indexed file names to compare.",
     )
 
     parser.add_argument(
         "--top-k-per-query",
         type=int,
-        default=2,
-        help="Chunks retrieved per comparison query per paper.",
+        default=1,
+        help="Compact evidence chunks per comparison evidence field.",
+    )
+
+    parser.add_argument(
+        "--candidate-top-k",
+        type=int,
+        default=20,
+        help="Number of dense retrieval candidates inspected internally.",
+    )
+
+    parser.add_argument(
+        "--max-chars-per-evidence",
+        type=int,
+        default=800,
+        help="Maximum characters per evidence chunk.",
     )
 
     parser.add_argument(
@@ -752,19 +952,19 @@ def parse_args():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.1,
+        default=0.2,
     )
 
     parser.add_argument(
         "--output-json",
         type=str,
-        default="reports/multi_paper_comparison.json",
+        default="reports/comparison.json",
     )
 
     parser.add_argument(
         "--output-md",
         type=str,
-        default="reports/multi_paper_comparison.md",
+        default="reports/comparison.md",
     )
 
     return parser.parse_args()
@@ -773,11 +973,13 @@ def parse_args():
 def main():
     args = parse_args()
 
-    generator = MultiPaperComparisonGenerator(
+    generator = ComparisonGenerator(
         top_k_per_query=args.top_k_per_query,
         llm_provider=args.llm_provider,
         llm_model_name=args.llm_model_name,
         temperature=args.temperature,
+        candidate_top_k=args.candidate_top_k,
+        max_chars_per_evidence=args.max_chars_per_evidence,
     )
 
     comparison = generator.generate(
@@ -787,7 +989,7 @@ def main():
     comparison_dict = comparison.to_dict()
     markdown = comparison_to_markdown(comparison)
 
-    print("\nMULTI-PAPER COMPARISON")
+    print("\nMULTI-PAPER COMPARISON V2")
     print("=" * 100)
     print(markdown)
 
